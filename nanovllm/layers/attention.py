@@ -17,17 +17,25 @@ def store_kvcache_kernel(
     v_cache_ptr,
     slot_mapping_ptr,
     D: tl.constexpr,
+    D_PAD: tl.constexpr,
 ):
     idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    d = tl.arange(0, D_PAD)
+    mask = d < D
+    key_offsets = idx * key_stride + d
+    value_offsets = idx * value_stride + d
+    key = tl.load(key_ptr + key_offsets, mask=mask, other=0.0)
+    value = tl.load(value_ptr + value_offsets, mask=mask, other=0.0)
+    cache_offsets = slot * D + d
+    tl.store(k_cache_ptr + cache_offsets, key, mask=mask)
+    tl.store(v_cache_ptr + cache_offsets, value, mask=mask)
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power of 2 ≥ n. 1 for n ≤ 1."""
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
@@ -37,7 +45,8 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+    D_PAD = _next_pow2(D)
+    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D, D_PAD)
 
 
 class Attention(nn.Module):

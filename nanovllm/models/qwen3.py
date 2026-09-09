@@ -174,8 +174,12 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
@@ -183,6 +187,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
+@register_model("qwen3")
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
@@ -206,8 +211,9 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(
         self,

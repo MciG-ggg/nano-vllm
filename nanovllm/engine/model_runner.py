@@ -1,4 +1,5 @@
 import pickle
+from torch import nn
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -6,15 +7,84 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.models.registry import get_model_class
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
+def allocate_paged_kv_cache(
+    model: nn.Module,
+    block_size: int,
+    gpu_memory_utilization: float,
+    world_size: int = 1,
+) -> torch.Tensor:
+    """Allocate paged KV cache and wire up each layer's ``k_cache``/``v_cache``.
+
+    Walks ``model`` looking for modules that expose both ``k_cache`` and
+    ``v_cache`` attributes (fork : ``Attention`` pattern); assigns cache
+    slices in layer order. Mutates ``model.config.num_kvcache_blocks``
+    with the actual allocation. Returns the allocated tensor of shape
+    ``(2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)``.
+
+    Fork's :class:`ModelRunner` calls this from ``allocate_kv_cache``;
+    external callers (talker / multi-stage setups) can reuse it
+    independently. Pure function — does not read module-level state.
+
+    ponytail: gpu_memory_utilization is the only knob callers may tune;
+    no per-stage override yet because the second model family that needs
+    a different cap hasn't appeared.
+    """
+    config = model.config
+    hf_config = config.hf_config
+    # On WSL, torch.cuda.mem_get_info() may return system RAM values.
+    # Use PyTorch's own tracking for accurate GPU memory accounting.
+    props = torch.cuda.get_device_properties(0)
+    total = props.total_memory
+    stats = torch.cuda.memory_stats()
+    used = (
+        stats["allocated_bytes.all.current"]
+        + stats["reserved_bytes.all.current"]
+    )
+    num_kv_heads = hf_config.num_key_value_heads // world_size
+    head_dim = getattr(
+        hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads
+    )
+    block_bytes = (
+        2
+        * hf_config.num_hidden_layers
+        * block_size
+        * num_kv_heads
+        * head_dim
+        * hf_config.dtype.itemsize
+    )
+    available = max(int(total * gpu_memory_utilization) - used, 0)
+    n = available // block_bytes
+    # WSL CUDA's cuMemGetInfo returns system RAM, so torch.empty()
+    # via the CUDA allocator may OOM even when PyTorch stats say OK.
+    # Cap to a fraction of actual GPU memory to stay safe.
+    safe_cap = int(total * 0.12) // block_bytes
+    config.num_kvcache_blocks = max(1, min(n, safe_cap))
+    kv_cache = torch.empty(
+        2,
+        hf_config.num_hidden_layers,
+        config.num_kvcache_blocks,
+        block_size,
+        num_kv_heads,
+        head_dim,
+    )
+    layer_id = 0
+    for module in model.modules():
+        if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+            module.k_cache = kv_cache[0, layer_id]
+            module.v_cache = kv_cache[1, layer_id]
+            layer_id += 1
+    return kv_cache
+
+
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], model_class=None):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -28,7 +98,9 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        # Registry-backed default: no fork-internal Qwen3 import needed.
+        # Custom model classes still win via ``model_class=...``.
+        self.model = (model_class or get_model_class("qwen3"))(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -101,24 +173,14 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
-        config = self.config
-        hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        # Delegate to the module-level helper so external callers (multi-stage
+        # setups, talker) can reuse the same allocation logic.
+        self.kv_cache = allocate_paged_kv_cache(
+            self.model,
+            self.block_size,
+            self.config.gpu_memory_utilization,
+            world_size=self.world_size,
+        )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -193,7 +255,21 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        # Inputs_embeds path: caller pre-computed the embedded hidden
+        # (e.g. talker with codec_proj + embed_proj). Always direct forward —
+        # the captured graph binds to ``input_ids`` and would ignore the
+        # alternative entry.
+        if inputs_embeds is not None:
+            return self.model.compute_logits(
+                self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+            )
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
