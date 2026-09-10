@@ -36,7 +36,13 @@ def allocate_paged_kv_cache(
     a different cap hasn't appeared.
     """
     config = model.config
-    hf_config = config.hf_config
+    # ``model.config`` may be either the fork ``Config`` dataclass (with a
+    # nested ``hf_config`` PretrainedConfig) or the PretrainedConfig itself
+    # (custom ``trust_remote_code`` models like MiniMind-3o whose HF
+    # ``config_class`` IS the model config). Unwrap accordingly.
+    hf_config = getattr(config, "hf_config", None)
+    if hf_config is None:
+        hf_config = config
     # On WSL, torch.cuda.mem_get_info() may return system RAM values.
     # Use PyTorch's own tracking for accurate GPU memory accounting.
     props = torch.cuda.get_device_properties(0)
@@ -64,11 +70,14 @@ def allocate_paged_kv_cache(
     # via the CUDA allocator may OOM even when PyTorch stats say OK.
     # Cap to a fraction of actual GPU memory to stay safe.
     safe_cap = int(total * 0.12) // block_bytes
-    config.num_kvcache_blocks = max(1, min(n, safe_cap))
+    num_kvcache_blocks = max(1, min(n, safe_cap))
+    # Write the block count back onto whichever config object the caller
+    # holds. PretrainedConfig allows attribute assignment at runtime.
+    setattr(config, "num_kvcache_blocks", num_kvcache_blocks)
     kv_cache = torch.empty(
         2,
         hf_config.num_hidden_layers,
-        config.num_kvcache_blocks,
+        num_kvcache_blocks,
         block_size,
         num_kv_heads,
         head_dim,
