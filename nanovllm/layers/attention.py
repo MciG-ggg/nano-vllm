@@ -139,12 +139,15 @@ def _sdpa_varlen_prefill(
     q,k,v are flat [N, H, D] with cu_seqlens indicating per-sequence boundaries.
     Runs SDPA per sequence; concatenates outputs.
     """
-    cu = cu_seqlens_q.cpu().tolist()
+    n_q, n_k, n_v = q.shape[0], k.shape[0], v.shape[0]
+    assert n_k == n_v, f"k/v length mismatch: {n_k} vs {n_v}"
+    # Clamp stale bucket edges when Q/K/V disagree in length.
+    cu = [min(int(c), n_q, n_k) for c in cu_seqlens_q.cpu().tolist()]
     rep = num_heads // num_kv_heads
     outs = []
     for i in range(len(cu) - 1):
         s, e = cu[i], cu[i + 1]
-        if s == e:
+        if s >= e:
             continue
         qi = q[s:e].transpose(0, 1)                       # [H_q, S, D]
         ki = k[s:e].transpose(0, 1)                       # [H_kv, S, D]
@@ -188,7 +191,18 @@ class Attention(nn.Module):
             # Non-prefix path: K/V are the freshly-computed prefill K/V tensors.
             paged_prefill = context.block_tables is not None
 
-            if _HAS_FLASH_ATTN:
+            if (
+                _HAS_FLASH_ATTN
+                and q.is_cuda
+                and q.is_contiguous()
+                and k.is_cuda
+                and k.is_contiguous()
+                and v.is_cuda
+                and v.is_contiguous()
+                and q.dim() == 3
+                and k.dim() == 3
+                and v.dim() == 3
+            ):
                 if paged_prefill:
                     # flash_attn reads from cache directly via block_table.
                     args_kv = (k_cache, v_cache)
