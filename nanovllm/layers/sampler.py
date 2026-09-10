@@ -62,9 +62,12 @@ class Sampler(nn.Module):
             # never collapses to empty. Mirrors the vLLM/transformers
             # recipe used by the HF MiniMind reference.
             remove = cumsum_probs > top_p
+            # Shift from the ORIGINAL row: keep sorted position i iff the
+            # cumsum strictly before i is already over budget. Cloning
+            # first is load-bearing — reading remove[..., :-1] after
+            # zeroing position 0 would widen the kept set by one.
+            keep_prev = remove[..., :-1].clone()
             remove[..., 0] = False
-            remove[..., 1:] = remove[..., :-1].clone()
-            logits = logits.scatter(
-                -1, sorted_i, sorted_l.masked_fill(remove, float("-inf"))
-            )
+            remove[..., 1:] = keep_prev
+            logits = logits.scatter(-1, sorted_i, sorted_l.masked_fill(remove, float("-inf")))
         return _gumbel_max_sample(logits)
