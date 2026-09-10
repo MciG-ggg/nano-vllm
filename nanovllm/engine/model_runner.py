@@ -190,6 +190,12 @@ class ModelRunner:
             self.config.gpu_memory_utilization,
             world_size=self.world_size,
         )
+        # ``allocate_paged_kv_cache`` writes ``num_kvcache_blocks`` onto
+        # ``model.config`` (the HF PretrainedConfig).  The fork ``Config``
+        # dataclass (``self.config``) is a *different* object; the
+        # Scheduler reads ``config.num_kvcache_blocks`` from the fork, so
+        # propagate the value here.
+        self.config.num_kvcache_blocks = self.model.config.num_kvcache_blocks
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
