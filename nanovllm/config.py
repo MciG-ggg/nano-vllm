@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+
 from transformers import AutoConfig
 
 
@@ -25,18 +26,33 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code
         )
-        # Multimodal wrappers (SmolVLMConfig = Idefics3Config) hold
-        # max_position_embeddings on .text_config, not the top level.
-        # Fall back so Config.__post_init__ works for shell models that
-        # nest the text backbone config inside text_config.
-        max_pos = getattr(
-            self.hf_config,
-            "max_position_embeddings",
-            getattr(
-                getattr(self.hf_config, "text_config", None),
+        # Multimodal shells (SmolVLM = Idefics3Config) hold the text
+        # backbone config under ``.text_config``; ``hidden_size`` etc.
+        # live there, not the top level. Materialise them as plain
+        # attributes on ``hf_config`` so downstream model_runner code
+        # (allocate_kv_cache, capture_cudagraph) can read them without
+        # walking into the nested structure. text_config takes
+        # precedence so shell vs nested views agree after __post_init__.
+        if hasattr(self.hf_config, "text_config"):
+            tc = self.hf_config.text_config
+            for k in (
+                "hidden_size",
+                "vocab_size",
                 "max_position_embeddings",
-                None,
-            ),
-        )
-        if max_pos is not None:
-            self.max_model_len = min(self.max_model_len, int(max_pos))
+                "num_hidden_layers",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "rms_norm_eps",
+                "rope_theta",
+                "rope_scaling",
+                "head_dim",
+                "tie_word_embeddings",
+                "dtype",
+            ):
+                v = getattr(tc, k, None)
+                if v is not None:
+                    setattr(self.hf_config, k, v)
+        if hasattr(self.hf_config, "max_position_embeddings"):
+            self.max_model_len = min(
+                self.max_model_len, int(self.hf_config.max_position_embeddings)
+            )
