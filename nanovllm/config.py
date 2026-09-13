@@ -25,4 +25,18 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code
         )
-        self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        # Multimodal wrappers (SmolVLMConfig = Idefics3Config) hold
+        # max_position_embeddings on .text_config, not the top level.
+        # Fall back so Config.__post_init__ works for shell models that
+        # nest the text backbone config inside text_config.
+        max_pos = getattr(
+            self.hf_config,
+            "max_position_embeddings",
+            getattr(
+                getattr(self.hf_config, "text_config", None),
+                "max_position_embeddings",
+                None,
+            ),
+        )
+        if max_pos is not None:
+            self.max_model_len = min(self.max_model_len, int(max_pos))
