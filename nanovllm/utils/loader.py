@@ -80,6 +80,14 @@ def load_model(model: nn.Module, path: str, prefix: str = ""):
                     else:
                         continue  # mapping exists but no key match — treat as plain
                     continue
-                param = model.get_parameter(full_name)
+                try:
+                    param = model.get_parameter(full_name)
+                except AttributeError:
+                    # Key has no matching parameter on this model; skip
+                    # silently so partial-model loads (e.g. minimind
+                    # thinker picking up the audio_proj / vision_proj /
+                    # talker keys that live on the same safetensors)
+                    # don't abort the whole load.
+                    continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, f.get_tensor(weight_name))
