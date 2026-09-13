@@ -18,13 +18,18 @@ def _resolve_packed_modules_mapping(
     Multimodal shells (SmolVLM, MiniMax Omni, etc.) hold submodules
     with different conventions -- the text backbone fuses q/k/v into
     ``qkv_proj`` but the SigLIP vision tower does not. We resolve
-    per-key by walking the module path until we find a submodule whose
-    own ``packed_modules_mapping`` declares a match for ``full_name``.
-    Top-level mapping is the fallback for standalone models.
+    per-key by walking the module path deepest-first: the closest
+    submodule whose ``packed_modules_mapping`` contains a key
+    matching the current weight name wins. Top-level mapping is
+    the fallback for standalone models (qwen3, etc.).
+
+    Submodules that *don't* declare a mapping (intermediate parents
+    like ``model.text_model``) are skipped silently so the search
+    keeps going up the tree. A submodule that declares a mapping
+    but does not match the current key stops the search because
+    that subtree uses a different convention than the rest.
     """
     parts = full_name.split(".")
-    # Walk the module path piece by piece; for each prefix, check
-    # whether that submodule declares a packed_modules_mapping.
     for end in range(len(parts), 0, -1):
         prefix_path = ".".join(parts[:end])
         try:
@@ -34,12 +39,12 @@ def _resolve_packed_modules_mapping(
         sub_mapping = getattr(sub, "packed_modules_mapping", None)
         if sub_mapping is None:
             continue
+        tail = full_name[len(prefix_path) + 1 :]
         for k in sub_mapping:
-            if k in full_name[len(prefix_path) + 1 :]:
+            if k in tail:
                 return sub_mapping
-        # Found a submodule with a mapping but it doesn't match this
-        # key; stop searching because nested mappings are not
-        # expected to coexist (single convention per family).
+        # Subtree declares a mapping but this key doesn't match --
+        # stop searching; another subtree has its own convention.
         return None
     return getattr(model, "packed_modules_mapping", None) or None
 
