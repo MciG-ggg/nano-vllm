@@ -60,7 +60,7 @@ def load_model(model: nn.Module, path: str, prefix: str = ""):
     """
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
-            for weight_name in f:
+            for weight_name in f.keys():
                 full_name = f"{prefix}{weight_name}" if prefix else weight_name
                 mapping = _resolve_packed_modules_mapping(model, full_name)
                 if mapping:
