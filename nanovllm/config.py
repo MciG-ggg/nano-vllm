@@ -18,6 +18,13 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     trust_remote_code: bool = False
+    # Largest batch size to capture a CUDA Graph for. Each captured graph
+    # holds a static-sized k/v gather of shape ``[bs, H_kv, S_max, D]``
+    # across all layers, so the upstream "capture every 16 up to 512"
+    # pattern needs ~25 GB at max_model_len=4096 with SmolVLM GQA and
+    # OOMs a 4 GB card. Raise it when a multi-request workload needs
+    # bigger graphs.
+    max_capture_bs: int = 8
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

@@ -294,7 +294,13 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            # ``graph_bs`` may stop below ``bs`` when capture was capped
+            # (``Config.max_capture_bs``). Fall back to eager instead of
+            # raising StopIteration on the ``next()`` search.
+            graph_bs = next((x for x in self.graph_bs if x >= bs), None)
+            if graph_bs is None:
+                return self.model.compute_logits(self.model(input_ids, positions))
+            graph = self.graphs[graph_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
