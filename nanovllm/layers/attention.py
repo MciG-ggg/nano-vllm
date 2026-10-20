@@ -62,19 +62,19 @@ def _gather_paged_kv_decode(
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather paged K/V for decode (one new token per sequence).
 
-    Returns contiguous [B, H_kv, S_max, D] tensors suitable for torch SDPA.
-    Positions beyond context_lens are zeroed so they don't leak.
+    Returns contiguous [B, H_kv, S_max, D] tensors suitable for torch SDPA
+    plus the [B, S_max] bool mask marking the real (non-padded) positions.
     """
     B = block_tables.shape[0]
     num_kv_heads = k_cache.shape[2]
     head_dim = k_cache.shape[3]
     # Static upper bound: precomputed host-side in ``prepare_decode`` (or
     # in ``capture_cudagraph`` for capture). Padding beyond
-    # ``context_lens`` is zeroed by ``valid`` below; SDPA adds no cost
-    # for the padded positions (single query token, masks do the work).
+    # ``context_lens`` is masked out by the caller; SDPA must mask them
+    # because a zeroed key still scores 0 and takes softmax weight.
     # Replaces ``int(context_lens.max().item())`` which forced a host
     # sync illegal under ``torch.cuda.graph`` capture.
     S_max = getattr(get_context(), "s_max", 0)
@@ -99,7 +99,7 @@ def _gather_paged_kv_decode(
     v = v_flat[flat_slots].transpose(1, 2).contiguous()
     k = k * valid.view(B, 1, S_max, 1)
     v = v * valid.view(B, 1, S_max, 1)
-    return k, v
+    return k, v, valid
 
 
 def _gather_paged_kv_prefill(
@@ -248,7 +248,7 @@ class Attention(nn.Module):
                                             softmax_scale=self.scale, causal=True)
             else:
                 block_size = getattr(context, 'block_size', 256)
-                k_cts, v_cts = _gather_paged_kv_decode(
+                k_cts, v_cts, valid = _gather_paged_kv_decode(
                     k_cache, v_cache, context.block_tables,
                     context.context_lens, block_size)
                 # q is [B, H_q, D]; reshape to [B, 1, H_q, D] for SDPA
@@ -258,8 +258,14 @@ class Attention(nn.Module):
                 if rep != 1:
                     k_cts = k_cts.repeat_interleave(rep, dim=1)
                     v_cts = v_cts.repeat_interleave(rep, dim=1)
+                # Mask the padded positions out of the softmax. The gather
+                # zeroes their K/V, but a zero key still scores 0 and takes
+                # softmax weight, which shrinks the output (measured: 1.6%
+                # of the unmasked norm at S_max=4096 vs 64 real tokens).
+                # [B, 1, 1, S_max] broadcasts over the head and query dims.
+                attn_mask = valid.view(B, 1, 1, -1)
                 o4 = torch.nn.functional.scaled_dot_product_attention(
-                    q4, k_cts, v_cts, is_causal=False, scale=self.scale)
+                    q4, k_cts, v_cts, attn_mask=attn_mask, is_causal=False, scale=self.scale)
                 # o4 is [B, H_q, 1, D] → squeeze seq dim → [B, H_q, D]
                 o = o4.squeeze(2)
         return o
