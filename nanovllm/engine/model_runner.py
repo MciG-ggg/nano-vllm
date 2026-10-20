@@ -99,6 +99,9 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.graph_max_seq_len = config.graph_max_seq_len
+        # The window the captured graphs serve. ``capture_cudagraph`` sets
+        # it; a request that reaches past it runs eager.
+        self.graph_s_max = config.graph_max_seq_len
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -307,7 +310,7 @@ class ModelRunner:
             # so it can only serve a context that fits in that window.
             # A longer context reads past the captured buffers, so it
             # falls back to the eager path.
-            if context.s_max > self.graph_max_seq_len:
+            if context.s_max > self.graph_s_max:
                 return self.model.compute_logits(self.model(input_ids, positions))
             # ``graph_bs`` may stop below ``bs`` when capture was capped
             # (``Config.max_capture_bs``). Fall back to eager instead of
@@ -365,6 +368,10 @@ class ModelRunner:
         # ``graph_max_seq_len`` positions. A longer context falls back
         # to the eager path (see ``run_model``).
         s_max = min(max_num_blocks * self.block_size, config.graph_max_seq_len)
+        # The replay gathers this many KV positions per sequence. A
+        # request with a longer context reads past the captured buffer,
+        # so ``run_model`` sends it to the eager path.
+        self.graph_s_max = s_max
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
