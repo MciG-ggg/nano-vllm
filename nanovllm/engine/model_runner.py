@@ -256,12 +256,16 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+        # Host-side upper bound for this step's gather. Becomes a static
+        # Python int inside the captured graph instead of forcing a
+        # ``.item()`` sync. ``max(..., default=0)`` covers the empty batch.
+        s_max = max(context_lens, default=0)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, s_max=s_max)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -322,13 +326,27 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # Cap graph capture at bs=8: each graph holds a static-sized k/v
+        # gather of shape ``[bs, H_kv, S_max, D]`` across all layers. At
+        # max_model_len=4096 with SmolVLM GQA (H_q=15, H_kv=5) a single
+        # bs=512 graph needs ~25 GB; the upstream pattern (capture 1..512
+        # by 16) OOMs on a 4 GB card. 8 covers the single-request bench
+        # path that actually exercises this code; raise via
+        # ``Config.max_capture_bs`` when a multi-request workload arrives.
+        max_capture_bs = getattr(config, "max_capture_bs", 8)
+        if max_capture_bs >= 16:
+            self.graph_bs = [1, 2, 4, 8] + list(range(16, max_capture_bs + 1, 16))
+        else:
+            self.graph_bs = [bs for bs in (1, 2, 4, 8) if bs <= max_capture_bs]
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            # Capture uses the full block-table capacity as the static
+            # ``s_max``; valid mask still filters real positions per
+            # replay.
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], s_max=max_num_blocks * self.block_size)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture

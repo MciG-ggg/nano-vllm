@@ -71,7 +71,18 @@ def _gather_paged_kv_decode(
     B = block_tables.shape[0]
     num_kv_heads = k_cache.shape[2]
     head_dim = k_cache.shape[3]
-    S_max = int(context_lens.max().item())
+    # Static upper bound: precomputed host-side in ``prepare_decode`` (or
+    # in ``capture_cudagraph`` for capture). Padding beyond
+    # ``context_lens`` is zeroed by ``valid`` below; SDPA adds no cost
+    # for the padded positions (single query token, masks do the work).
+    # Replaces ``int(context_lens.max().item())`` which forced a host
+    # sync illegal under ``torch.cuda.graph`` capture.
+    S_max = getattr(get_context(), "s_max", 0)
+    if S_max == 0:
+        # Fallback for callers that haven't plumbed s_max through yet
+        # (e.g. tests). Path is capture-unsafe but lets unmigrated
+        # callers keep working.
+        S_max = int(context_lens.max().item())
     device = k_cache.device
 
     # Vectorised gather: token_idx[b, s] = block_tables[b, s//block_size] * block_size + s%block_size
