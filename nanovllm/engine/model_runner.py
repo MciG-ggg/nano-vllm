@@ -116,7 +116,15 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            try:
+                self.capture_cudagraph()
+            except Exception as exc:
+                # The capture fails on some devices (an old driver on
+                # the RTX 3050 invalidates the capture stream). The
+                # eager path gives the same tokens, only slower, so the
+                # runner keeps working without the graph.
+                print(f"[nanovllm] CUDA graph capture failed ({exc}); running eager")
+                self.enforce_eager = True
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
