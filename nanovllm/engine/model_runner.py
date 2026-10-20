@@ -98,6 +98,7 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.graph_max_seq_len = config.graph_max_seq_len
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -294,6 +295,12 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
+            # The captured graph gathers a fixed number of KV positions,
+            # so it can only serve a context that fits in that window.
+            # A longer context reads past the captured buffers, so it
+            # falls back to the eager path.
+            if context.s_max > self.graph_max_seq_len:
+                return self.model.compute_logits(self.model(input_ids, positions))
             # ``graph_bs`` may stop below ``bs`` when capture was capped
             # (``Config.max_capture_bs``). Fall back to eager instead of
             # raising StopIteration on the ``next()`` search.
@@ -339,20 +346,24 @@ class ModelRunner:
         # by 16) OOMs on a 4 GB card. 8 covers the single-request bench
         # path that actually exercises this code; raise via
         # ``Config.max_capture_bs`` when a multi-request workload arrives.
-        max_capture_bs = getattr(config, "max_capture_bs", 8)
+        max_capture_bs = min(getattr(config, "max_capture_bs", 8), max_bs)
         if max_capture_bs >= 16:
             self.graph_bs = [1, 2, 4, 8] + list(range(16, max_capture_bs + 1, 16))
         else:
             self.graph_bs = [bs for bs in (1, 2, 4, 8) if bs <= max_capture_bs]
         self.graphs = {}
         self.graph_pool = None
+        # The captured gather is static, so it covers a window of
+        # ``graph_max_seq_len`` positions. A longer context falls back
+        # to the eager path (see ``run_model``).
+        s_max = min(max_num_blocks * self.block_size, config.graph_max_seq_len)
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             # Capture uses the full block-table capacity as the static
             # ``s_max``; valid mask still filters real positions per
             # replay.
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], s_max=max_num_blocks * self.block_size)
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], s_max=s_max)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
