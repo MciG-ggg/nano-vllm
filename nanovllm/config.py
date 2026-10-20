@@ -25,6 +25,11 @@ class Config:
     # OOMs a 4 GB card. Raise it when a multi-request workload needs
     # bigger graphs.
     max_capture_bs: int = 8
+    # Longest context the captured graphs serve. The captured decode
+    # gathers ``graph_max_seq_len`` KV positions per layer on every
+    # token, so a big value costs GPU memory and gather time. A request
+    # whose context grows past this length falls back to the eager path.
+    graph_max_seq_len: int = 512
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
